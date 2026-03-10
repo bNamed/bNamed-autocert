@@ -59,7 +59,7 @@ Example DNS record:
 
 Clone the repository:
 
-    git clone https://github.com/YOURACCOUNT/bnamed-autocert.git
+    git clone https://github.com/bNamed/bNamed-autocert.git
     cd bnamed-autocert
 
 Make the script executable:
