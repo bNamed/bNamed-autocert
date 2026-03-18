@@ -17,6 +17,7 @@ COMBINED_PEM_PATH=""
 
 CERTTYPE="PositiveSSL"
 AUTOPAY="true"
+RENEW_BEFORE_DAYS=19
 
 MAX_POLLS=20
 POLL_INTERVAL=60
@@ -29,7 +30,9 @@ Usage:
     --cn "CN"
     --privkey /path/privkey.pem
     --fullchain /path/fullchain.pem
+    [--combined-pem /path/combined.pem]
     [--certtype TYPE] [--autopay true|false]
+    [--renew-before-days N]
     [--max-polls N] [--poll-interval SEC]
 
 Notes:
@@ -99,6 +102,7 @@ while [[ $# -gt 0 ]]; do
 
     --certtype)      CERTTYPE="$2"; shift 2 ;;
     --autopay)       AUTOPAY="$2"; shift 2 ;;
+    --renew-before-days) RENEW_BEFORE_DAYS="$2"; shift 2 ;;
 
     --max-polls)     MAX_POLLS="$2"; shift 2 ;;
     --poll-interval) POLL_INTERVAL="$2"; shift 2 ;;
@@ -115,9 +119,6 @@ done
 # =============================
 # 4) Validation
 # =============================
-command -v curl >/dev/null 2>&1    || { echo "ERROR: curl is required"; exit 1; }
-command -v xmllint >/dev/null 2>&1 || { echo "ERROR: xmllint is required (libxml2-utils)"; exit 1; }
-
 if [[ -z "$APIUID" || -z "$APIKEY" ]]; then
   echo "ERROR: APIUID and APIKEY must be set (config or CLI)." >&2
   exit 2
@@ -130,6 +131,11 @@ fi
 
 if [[ -z "$PRIVKEY_PATH" && -z "$FULLCHAIN_PATH" && -z "$COMBINED_PEM_PATH" ]]; then
   echo "ERROR: You must configure at least one of: PRIVKEY_PATH, FULLCHAIN_PATH, COMBINED_PEM_PATH." >&2
+  exit 2
+fi
+
+if ! [[ "$RENEW_BEFORE_DAYS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --renew-before-days must be a non-negative integer." >&2
   exit 2
 fi
 
@@ -149,6 +155,136 @@ timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 clean_pem() {
   sed -e 's/\r$//' -e '/^[[:space:]]*$/d'
 }
+
+extract_first_cert() {
+  local source_file="$1"
+  awk '
+    /-----BEGIN CERTIFICATE-----/ {
+      in_cert=1
+      seen=1
+    }
+    in_cert {
+      print
+    }
+    /-----END CERTIFICATE-----/ && in_cert {
+      exit
+    }
+    END {
+      if (!seen) {
+        exit 1
+      }
+    }
+  ' "$source_file"
+}
+
+get_existing_cert_source() {
+  if [[ -n "$FULLCHAIN_PATH" && -f "$FULLCHAIN_PATH" ]]; then
+    printf '%s\n' "$FULLCHAIN_PATH"
+    return 0
+  fi
+
+  if [[ -n "$COMBINED_PEM_PATH" && -f "$COMBINED_PEM_PATH" ]]; then
+    printf '%s\n' "$COMBINED_PEM_PATH"
+    return 0
+  fi
+
+  return 1
+}
+
+get_cert_expiry_with_openssl() {
+  local cert_file="$1"
+  local threshold_seconds="$2"
+
+  CURRENT_CERT_EXPIRY="$(openssl x509 -noout -enddate -in "$cert_file" 2>/dev/null | sed 's/^notAfter=//')"
+  [[ -n "$CURRENT_CERT_EXPIRY" ]] || return 1
+
+  if openssl x509 -noout -checkend "$threshold_seconds" -in "$cert_file" >/dev/null 2>&1; then
+    CERT_RENEWAL_NEEDED="false"
+  else
+    CERT_RENEWAL_NEEDED="true"
+  fi
+
+  return 0
+}
+
+get_cert_expiry_with_certdecode() {
+  local cert_file="$1"
+  local threshold_seconds="$2"
+  local response expires_at_utc expires_at_unix now_unix remaining_seconds
+
+  response="$(
+    curl -fsS -X POST https://certdecode.com/getDate.php \
+      --data-urlencode "certificate@${cert_file}" \
+      -H "Accept: application/json"
+  )" || return 1
+
+  expires_at_utc="$(printf '%s' "$response" | sed -n 's/.*"expires_at_utc"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+  expires_at_unix="$(printf '%s' "$response" | sed -n 's/.*"expires_at_unix"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+
+  [[ -n "$expires_at_utc" && -n "$expires_at_unix" ]] || return 1
+
+  CURRENT_CERT_EXPIRY="$expires_at_utc"
+  now_unix="$(date -u +%s)"
+  remaining_seconds=$((expires_at_unix - now_unix))
+
+  if (( remaining_seconds > threshold_seconds )); then
+    CERT_RENEWAL_NEEDED="false"
+  else
+    CERT_RENEWAL_NEEDED="true"
+  fi
+
+  return 0
+}
+
+should_skip_renewal() {
+  local existing_cert_source extracted_cert threshold_seconds
+
+  existing_cert_source="$(get_existing_cert_source)" || return 1
+  extracted_cert="$TMPDIR/current-cert.pem"
+  threshold_seconds=$((RENEW_BEFORE_DAYS * 86400))
+
+  if ! extract_first_cert "$existing_cert_source" > "$extracted_cert"; then
+    echo "WARN: Existing certificate file $existing_cert_source does not contain a readable PEM certificate; continuing with renewal." >&2
+    return 1
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    if ! get_cert_expiry_with_openssl "$extracted_cert" "$threshold_seconds"; then
+      echo "WARN: Could not determine certificate expiry with openssl from $existing_cert_source; continuing with renewal." >&2
+      return 1
+    fi
+  else
+    if ! command -v curl >/dev/null 2>&1; then
+      echo "WARN: openssl is not available and curl is missing for expiry lookup; continuing with renewal." >&2
+      return 1
+    fi
+    if ! get_cert_expiry_with_certdecode "$extracted_cert" "$threshold_seconds"; then
+      echo "WARN: Could not determine certificate expiry from $existing_cert_source; continuing with renewal." >&2
+      return 1
+    fi
+  fi
+
+  echo "Existing certificate found at $existing_cert_source"
+  echo "Current certificate expires at: $CURRENT_CERT_EXPIRY"
+
+  if [[ "$CERT_RENEWAL_NEEDED" == "false" ]]; then
+    echo "Certificate is valid for more than ${RENEW_BEFORE_DAYS} day(s); skipping renewal."
+    return 0
+  fi
+
+  echo "Certificate expires within ${RENEW_BEFORE_DAYS} day(s); requesting renewal."
+  return 1
+}
+
+CURRENT_CERT_EXPIRY=""
+CERT_RENEWAL_NEEDED="true"
+
+if should_skip_renewal; then
+  exit 0
+fi
+
+command -v curl >/dev/null 2>&1    || { echo "ERROR: curl is required"; exit 1; }
+command -v xmllint >/dev/null 2>&1 || { echo "ERROR: xmllint is required (libxml2-utils)"; exit 1; }
 
 # =============================
 # 6) requestAutoCert (with one retry on 19901)
