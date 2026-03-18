@@ -151,6 +151,6 @@ Example:
 
 ---
 
-The script will request a new certificate even if the current certificate doesn't need to be replaced yet. So only run it near the current expiration date of your certificate. We do plan in future versions to include a check on the expiration date to only run when needed. 
+The script will not request a new certificate if the current certificate on file is still valid for a long time (RENEW_BEFORE_DAYS=19). We advice to run the script automatically once every week.
 
 
