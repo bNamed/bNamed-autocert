@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+EXIT_RENEWED=0
+EXIT_SKIPPED=1
+EXIT_ERROR=2
+
 # -----------------------------
 # Defaults
 # -----------------------------
@@ -111,7 +115,7 @@ while [[ $# -gt 0 ]]; do
     *)
       echo "Unknown arg: $1" >&2
       usage
-      exit 2
+      exit "$EXIT_ERROR"
       ;;
   esac
 done
@@ -121,22 +125,22 @@ done
 # =============================
 if [[ -z "$APIUID" || -z "$APIKEY" ]]; then
   echo "ERROR: APIUID and APIKEY must be set (config or CLI)." >&2
-  exit 2
+  exit "$EXIT_ERROR"
 fi
 
 if [[ -z "$CN" ]]; then
   echo "ERROR: --cn (CN) must be set (config or CLI)." >&2
-  exit 2
+  exit "$EXIT_ERROR"
 fi
 
 if [[ -z "$PRIVKEY_PATH" && -z "$FULLCHAIN_PATH" && -z "$COMBINED_PEM_PATH" ]]; then
   echo "ERROR: You must configure at least one of: PRIVKEY_PATH, FULLCHAIN_PATH, COMBINED_PEM_PATH." >&2
-  exit 2
+  exit "$EXIT_ERROR"
 fi
 
 if ! [[ "$RENEW_BEFORE_DAYS" =~ ^[0-9]+$ ]]; then
   echo "ERROR: --renew-before-days must be a non-negative integer." >&2
-  exit 2
+  exit "$EXIT_ERROR"
 fi
 
 # =============================
@@ -272,7 +276,7 @@ should_skip_renewal() {
     return 0
   fi
 
-  echo "Certificate expires within ${RENEW_BEFORE_DAYS} day(s); requesting renewal."
+  echo "Certificate expires within less than ${RENEW_BEFORE_DAYS} day(s); requesting renewal."
   return 1
 }
 
@@ -280,11 +284,11 @@ CURRENT_CERT_EXPIRY=""
 CERT_RENEWAL_NEEDED="true"
 
 if should_skip_renewal; then
-  exit 0
+  exit "$EXIT_SKIPPED"
 fi
 
-command -v curl >/dev/null 2>&1    || { echo "ERROR: curl is required"; exit 1; }
-command -v xmllint >/dev/null 2>&1 || { echo "ERROR: xmllint is required (libxml2-utils)"; exit 1; }
+command -v curl >/dev/null 2>&1    || { echo "ERROR: curl is required"; exit "$EXIT_ERROR"; }
+command -v xmllint >/dev/null 2>&1 || { echo "ERROR: xmllint is required (libxml2-utils)"; exit "$EXIT_ERROR"; }
 
 # =============================
 # 6) requestAutoCert (with one retry on 19901)
@@ -317,13 +321,13 @@ fi
 if [[ "$ERRORCODE" != "0" ]]; then
   ERRORTEXT="$(xmllint --xpath 'string(/API/ErrorText)' - <<<"$REQ_XML" 2>/dev/null || true)"
   echo "ERROR: requestAutoCert failed: ErrorCode=$ERRORCODE $ERRORTEXT" >&2
-  exit 1
+  exit "$EXIT_ERROR"
 fi
 
 REQUEST_ID="$(xmllint --xpath 'string(/API/Result/Request-ID)' - <<<"$REQ_XML")"
 if [[ -z "$REQUEST_ID" ]]; then
   echo "ERROR: Could not parse Request-ID from requestAutoCert response" >&2
-  exit 1
+  exit "$EXIT_ERROR"
 fi
 echo "Request-ID: $REQUEST_ID"
 
@@ -333,14 +337,14 @@ xmllint --xpath 'string(/API/Result/PK)' - <<<"$REQ_XML" \
 
 if ! grep -q '^-----BEGIN .*PRIVATE KEY-----' "$tmp_priv"; then
   echo "ERROR: Private key does not look like PEM" >&2
-  exit 1
+  exit "$EXIT_ERROR"
 fi
 
 # Optional: parse check with OpenSSL if available
 if command -v openssl >/dev/null 2>&1; then
   if ! openssl pkey -noout -in "$tmp_priv" >/dev/null 2>&1; then
     echo "ERROR: Private key is not parseable by OpenSSL" >&2
-    exit 1
+    exit "$EXIT_ERROR"
   fi
 fi
 
@@ -362,7 +366,7 @@ for ((i=1; i<=MAX_POLLS; i++)); do
   if [[ "$ERRORCODE" != "0" ]]; then
     ERRORTEXT="$(xmllint --xpath 'string(/API/ErrorText)' - <<<"$GET_XML" 2>/dev/null || true)"
     echo "ERROR: getAutoCert failed: ErrorCode=$ERRORCODE $ERRORTEXT" >&2
-    exit 1
+    exit "$EXIT_ERROR"
   fi
 
   status="$(xmllint --xpath 'string(/API/Result/status)' - <<<"$GET_XML" 2>/dev/null || true)"
@@ -381,18 +385,18 @@ done
 
 if [[ "$status" != "completed" ]]; then
   echo "ERROR: Timed out waiting for certificate (last status=$status)" >&2
-  exit 1
+  exit "$EXIT_ERROR"
 fi
 
 if ! grep -q '^-----BEGIN CERTIFICATE-----' "$tmp_chain"; then
   echo "ERROR: Certificate chain does not look like PEM" >&2
-  exit 1
+  exit "$EXIT_ERROR"
 fi
 
 if command -v openssl >/dev/null 2>&1; then
   if ! openssl x509 -noout -in "$tmp_chain" >/dev/null 2>&1; then
     echo "ERROR: Certificate chain is not parseable by OpenSSL" >&2
-    exit 1
+    exit "$EXIT_ERROR"
   fi
 fi
 
@@ -439,3 +443,4 @@ echo "OK. Updated:"
 [[ -n "$FULLCHAIN_PATH" ]]     && echo "  $FULLCHAIN_PATH"
 [[ -n "$COMBINED_PEM_PATH" ]]  && echo "  $COMBINED_PEM_PATH"
 echo "Backups (if any): *.${timestamp}.bak"
+exit "$EXIT_RENEWED"
